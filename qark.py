@@ -567,11 +567,11 @@ try:
 	act_priv_list, act_exp_list, act_exp_perm_list, act_prot_broad_list=[],[],[],[]
 	act_priv_list, act_exp_list, act_exp_perm_list, act_prot_broad_list, report_data, results=common.check_export('activity',True)
 
-	#Normalizing activity names for use in exploit APK to all be fully qualified
-	common.normalizeActivityNames(act_priv_list,package_name)
-	common.normalizeActivityNames(act_exp_list,package_name)
-	common.normalizeActivityNames(act_exp_perm_list,package_name)
-	common.normalizeActivityNames(act_prot_broad_list,package_name)
+	#Normalizing activity names for use in exploit APK, so all will be absolute
+	act_priv_list=common.normalizeActivityNames(act_priv_list,package_name)
+	act_exp_list=common.normalizeActivityNames(act_exp_list,package_name)
+	act_exp_perm_list=common.normalizeActivityNames(act_exp_perm_list,package_name)
+	act_prot_broad_list=common.normalizeActivityNames(act_prot_broad_list,package_name)
 
 	reportBadger("appcomponents", results)
 	common.print_terminal(report_data)
@@ -978,6 +978,8 @@ if exploit_choice==1:
 				print str(i)
 				extras_list=[]
 				extras_list+=intents.find_extras(str(i),common.sourceDirectory)
+				if re.match(r'^\..*',str(i)):
+					i=str(package_name)+str(i)
 				exploit.setExportedActivity(str(i))
 				for j in range(0,len(extras_list)):
 					extras_list[j] = extras_list[j].replace('\"','')
@@ -992,7 +994,6 @@ if exploit_choice==1:
 		if len(actalias_exp_list)>0:
 			print "ok"
 		if len(serv_exp_list)>0:
-			print "ok"
 			for i in range(0, len(serv_exp_list)):
 				exploit = createExploit.exploitService()
 				exploit.setIntent(filters.find_package() + serv_exp_list[i])
