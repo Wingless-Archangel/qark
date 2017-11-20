@@ -13,57 +13,50 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)) + '/lib')
 import stat
 import fnmatch
 import subprocess
-import urllib2
-import ast
-import string
 from subprocess import Popen, PIPE, STDOUT
 from collections import defaultdict
 from xml.dom import minidom
 import traceback
 import logging
 import time
+import shlex
 import shutil
 from threading import Thread, Lock
 from Queue import Queue
 # sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)) + '/lib')
 
-from modules.IssueType import IssueSeverity
-from modules.IssueType import IssueType
 from modules import common
 from modules import findExtras
 from modules import webviews
 from modules import report
 from modules import unpackAPK
-from lib.axmlparserpy import axmlprinter 
+from lib.axmlparserpy import axmlprinter
 from modules.DetermineMinSDK import determine_min_sdk
 from modules import sdkManager
 from modules import createSploit
 from modules import createExploit
 from modules import writeExploit
-from modules import intentTracer
 from modules import findMethods
 from modules import findPending
 from modules import findBroadcasts
 from modules import findTapJacking
 from modules import filePermissions
 from modules import exportedPreferenceActivity
-from modules import useCheckPermission
 from modules import cryptoFlaws
 from modules import certValidation
 from modules import GeneralIssues
 from modules import contentProvider
+from modules.createExploit import ExploitType
 from modules.contentProvider import *
 from modules import filters
-from modules.report import Severity, ReportIssue
-from modules.createExploit import ExploitType
 from modules.common import terminalPrint, Severity, ReportIssue
 from modules import adb
 from lib import argparse
-from lib.pyfiglet import Figlet
 from lib.pubsub import pub
 from lib.progressbar import ProgressBar, Percentage, Bar
 from lib.yapsy.PluginManager import PluginManager
-#from yapsy.PluginManager import PluginManager
+import csv
+import json
 
 common.qark_package_name=''
 pbar_file_permission_done = False
@@ -91,6 +84,9 @@ def clear(n):
     with common.term.location():
         print("\n"*n)
 
+def valid_manifest_file(manifest_path):
+    return bool(manifest_path) and manifest_path.lower() not in ("false", "f")
+
 def get_manifestXML(mf):
     common.manifest = mf
 
@@ -104,14 +100,38 @@ def apktool(pathToAPK):
     print str(pathToAPK.rsplit(".",1)[0]).rsplit("/",1)[0] + "/apktool" + "/AndroidManifest.xml"
     with open (str(pathToAPK.rsplit(".",1)[0]).rsplit("/",1)[0] + "/apktool" + "/AndroidManifest.xml", "r") as f:
         manifest = f.read()
+    common.args.manifest = str(pathToAPK.rsplit(".",1)[0]).rsplit("/",1)[0] + "/apktool" + "/AndroidManifest.xml"
     pub.sendMessage('manifest', mf=manifest)
     return
+
+
+def json2xml(json_obj, line_padding=""):
+    result_list = list()
+
+    json_obj_type = type(json_obj)
+
+    if json_obj_type is list:
+        for sub_elem in json_obj:
+            result_list.append(json2xml(sub_elem, line_padding))
+
+        return "\n".join(result_list)
+
+    elif json_obj_type is dict:
+        for tag_name in json_obj:
+            sub_obj = json_obj[tag_name]
+            result_list.append("{}<{}>".format(line_padding, tag_name))
+            result_list.append(json2xml(sub_obj, "\t" + line_padding))
+            result_list.append("{}</{}>".format(line_padding, tag_name))
+
+        return "\n".join(result_list)
+
+    return "{}{}".format(line_padding, json_obj)
 
 
 def progress_bar_update(bar, percent):
     lock.acquire()
 
-    global pbar_file_permission_done 
+    global pbar_file_permission_done
     if bar == "File Permissions" and percent >= 100 and not pbar_file_permission_done:
         pbar_file_permission_done = True
         bar = "File Permissions (check 1)"
@@ -171,28 +191,6 @@ def show_exports(compList,compType):
     return
 
 
-
-def read_files(filename,rex):
-    things_to_inspect=[]
-    with open(filename) as f:
-        content=f.readlines()
-        for y in content:
-            if re.search(rex,y):
-                if re.match(r'^\s*(\/\/|\/\*)',y): #exclude single-line or beginning comments
-                    pass
-                elif re.match(r'^\s*\*',y): #exclude lines that are comment bodies
-                    pass
-                elif re.match(r'.*\*\/$',y): #exclude lines that are closing comments
-                    pass
-                elif re.match(r'^\s*Log\..\(',y): #exclude Logging functions
-                    pass
-                elif re.match(r'(.*)(public|private)\s(String|List)',y): #exclude declarations
-                    pass
-                else:
-                    things_to_inspect.append(y)
-    return things_to_inspect
-
-
 def process_manifest(manifest):
     try:
         common.manifest = os.path.abspath(str(manifest).strip())
@@ -214,12 +212,19 @@ def process_manifest(manifest):
                 exit()
             common.logger.error(str(e) + "\r\nThat didnt work. Try providing an absolute path to the file\n")
 
+def hasmode(filename, mode):
+    st = os.stat(filename)
+    return (st.st_mode & mode)
+
+def setmode(filename, mode):
+    st = os.stat(filename)
+    os.chmod(filename, st.st_mode | mode)
 
 def list_all_apk():
     result = []
     adb = common.getConfig('AndroidSDKPath') + "platform-tools/adb"
     st = os.stat(adb)
-    os.chmod(adb, st.st_mode | stat.S_IEXEC)
+    if not hasmode(adb, stat.S_IEXEC): setmode(adb, stat.S_IEXEC)
     while True:
         p1 = Popen([adb, 'devices'], stdout=PIPE, stdin=PIPE, stderr=STDOUT)
         a = 0
@@ -244,19 +249,15 @@ def list_all_apk():
         index+=1
     return result
 
+
 def uninstall(package):
     print "trying to uninstall " + package
-    result = []
     adb = common.getConfig('AndroidSDKPath') + "platform-tools/adb"
-    st = os.stat(adb)
-    os.chmod(adb, st.st_mode | stat.S_IEXEC)
+    if not hasmode(adb, stat.S_IEXEC): setmode(adb, stat.S_IEXEC)
     while True:
         p1 = Popen([adb, 'devices'], stdout=PIPE, stdin=PIPE, stderr=STDOUT)
-        a = 0
-        for line in p1.stdout:
-            a = a+1
-            # If atleast one device is connected
-        if a >2 :
+        a = len(p1.stdout.readlines())
+        if a > 2:
             break
         else:
             common.logger.warning("Waiting for a device to be connected...")
@@ -265,13 +266,13 @@ def uninstall(package):
     for line in uninstall.stdout:
         if "Failure" in line:
             package = re.sub('-\d$', '', package)
-            uninstall_try_again = Popen([adb, 'shell', 'pm', 'uninstall', package], stdout=PIPE, stdin=PIPE, stderr=STDOUT)
+            Popen([adb, 'shell', 'pm', 'uninstall', package], stdout=PIPE, stdin=PIPE, stderr=STDOUT)
     return
 
 def pull_apk(pathOnDevice):
     adb = common.getConfig('AndroidSDKPath') + "platform-tools/adb"
     st = os.stat(adb)
-    os.chmod(adb, st.st_mode | stat.S_IEXEC)
+    if not hasmode(adb, stat.S_IEXEC): setmode(adb, stat.S_IEXEC)
     if not os.path.exists('temp' + "/"):
         os.makedirs('temp' + "/")
     p0 = Popen([adb, 'pull', pathOnDevice, 'temp/'+str(pathOnDevice).split('/')[-1]], stdout=PIPE, stdin=PIPE, stderr=STDOUT)
@@ -345,7 +346,7 @@ def writeReportSection(results, category):
     elif category == "PLUGIN ISSUES":
         section = report.Section.PLUGIN
 
-    try: 
+    try:
         report.writeSection(section, results)
     except Exception as e:
         print e.message
@@ -353,6 +354,9 @@ def writeReportSection(results, category):
         common.logger.log(common.HEADER_ISSUES_LEVEL, category)
     if not any(isinstance(x, terminalPrint) for x in results):
         common.logger.info(" No issues to report")
+
+    csv_file = open('./Report.csv', 'a+')
+    writer = csv.writer(csv_file)
     for item in results:
         if isinstance(item, terminalPrint):
             if item.getLevel() == Severity.INFO:
@@ -363,28 +367,11 @@ def writeReportSection(results, category):
                 common.logger.error(item.getData())
             if item.getLevel() == Severity.VULNERABILITY:
                 common.logger.log(common.VULNERABILITY_LEVEL,item.getData())
+        elif isinstance(item, ReportIssue):
+            report.write_csv_section(item, writer)
+    csv_file.close()
 
-
-def nonAutomatedParseArgs():
-    ignore = os.system('clear')
-    f = Figlet(font='colossal')
-    print f.renderText('Q A R K')
-
-
-    common.logger = logging.getLogger()
-    common.rootDir = os.path.dirname(os.path.realpath(__file__))
-
-    #Initialize system
-    #Verify that settings.properties always exists
-    if not os.path.exists(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties"):
-        f = open(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties",'w')
-        f.close()
-
-    #
-    common.writeKey("rootDir", common.rootDir)
-
-    common.initialize_logger()
-    #######################################
+def setup_argparse():
     parser = argparse.ArgumentParser(description='QARK - Andr{o}id Source Code Analyzer and Exploitation Tool')
     required = parser.add_argument_group('Required')
     mode = parser.add_argument_group('Mode')
@@ -392,51 +379,44 @@ def nonAutomatedParseArgs():
     auto = parser.add_argument_group('When --source=1')
     optional = parser.add_argument_group('Optional')
     exploitmenu = parser.add_argument_group('Exploit Generation')
-    mode.add_argument("-s", "--source", dest="source", metavar='int', type=int, help="1 if you have an APK, 2 if you want to specify the source selectively")
-    advanced.add_argument("-m", "--manifest", dest="manifest", help="Enter the full path to the manifest file. Required only when --source==2")
-    auto.add_argument("-p", "--pathtoapk", dest="apkpath", help="Enter the full path to the APK file. Required only when --source==1")
+    mode.add_argument("-s", "--source", dest="source", metavar='int', type=int,
+                      help="1 if you have an APK, 2 if you want to specify the source selectively")
+    advanced.add_argument("-m", "--manifest", dest="manifest",
+                          help="Enter the full path to the manifest file. Required only when --source==2")
+    auto.add_argument("-p", "--pathtoapk", dest="apkpath",
+                      help="Enter the full path to the APK file. Required only when --source==1")
 
     advanced_mutual = advanced.add_mutually_exclusive_group()
-    advanced_mutual.add_argument("-a", "--autodetectcodepath", dest="autodetect", help="AutoDetect java source code path based of the path provided for manifest. 1=autodetect, 0=specify manually")
-    advanced_mutual.add_argument("-c", "--codepath", dest="codepath", help="Enter the full path to the root folder containing java source. Required only when --source==2")
+    advanced_mutual.add_argument("-a", "--autodetectcodepath", dest="autodetect", default=1,
+                                 help="AutoDetect java source code path based off the path provided for manifest. 1=autodetect, 0=specify manually")
+    advanced_mutual.add_argument("-c", "--codepath", dest="codepath",
+                                 help="Enter the full path to the root folder containing java source. Required only when --source==2")
 
-    optional.add_argument("-e", "--exploit", dest="exploit", help="1 to generate a targeted exploit APK, 0 to skip")
-#     optional.add_argument("-n", "--no-progress-bar", dest="noprogressbar", help="dont display progress bar for compatibility reasons", default=False, action='store_true')
-    optional.add_argument("-i", "--install", dest="install", help="1 to install exploit APK on the device, 0 to skip")
-    optional.add_argument("-d", "--debug", dest="debuglevel", help="Debug Level. 10=Debug, 20=INFO, 30=Warning, 40=Error")
+    optional.add_argument("-e", "--exploit", dest="exploit", default=0, help="2 to generate XML/JSON files, 1 to generate a targeted exploit APK, 0 to skip")
+    optional.add_argument("--decompile", action="store_true", help="To stop Qark after decompilation")
+    #     optional.add_argument("-n", "--no-progress-bar", dest="noprogressbar", help="dont display progress bar for compatibility reasons", default=False, action='store_true')
+    optional.add_argument("-i", "--install", action="store_true", help="Install exploit APK on the device")
+    optional.add_argument("-d", "--debug", dest="debuglevel", default=20,
+                          help="Debug Level. 10=Debug, 20=INFO, 30=Warning, 40=Error")
     optional.add_argument("-v", "--version", dest="version", help="Print version info", action='store_true')
-    optional.add_argument("-r", "--reportdir", dest="reportdir", help="Specify full path for output report directory. Defaults to /report")
+    optional.add_argument("-r", "--reportdir", dest="reportDir",
+                          help="Specify full path for output report directory. Defaults to /report")
     required_group = required.add_mutually_exclusive_group()
-    required_group.add_argument("-t", "--acceptterms", dest="acceptterms", help="Automatically accept terms and conditions when downloading Android SDK")
-    required_group.add_argument("-b", "--basesdk", dest="basesdk", help="specify the full path to the root directory of the android sdk")
+    required_group.add_argument("-t", "--acceptterms", dest="acceptterms",
+                                help="Automatically accept terms and conditions when downloading Android SDK")
+    required_group.add_argument("-b", "--basesdk", dest="basesdk",
+                                help="specify the full path to the root directory of the android sdk")
 
-    common.args = parser.parse_args()
-    main()
-
-def runAutomated(pathToApk,pathToReport):
-    ignore = os.system('clear')
-    f = Figlet(font='colossal')
-    print f.renderText('Q A R K')
+    return parser
 
 
-    common.logger = logging.getLogger()
-    common.rootDir = os.path.dirname(os.path.realpath(__file__))
-
-    #Initialize system
-    #Verify that settings.properties always exists
-    if not os.path.exists(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties"):
-        f = open(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties",'w')
-        f.close()
-
-    #
-    common.writeKey("rootDir", common.rootDir)
-
-    common.initialize_logger()
-    common.args = argparse.Namespace() 
+def run_automated_defaults(pathToReport, pathToApk):
+    common.args = argparse.Namespace()
     common.args.exploit = 0
     common.args.install = 0
     common.args.source = 1
     common.args.reportDir = pathToReport
+    common.args.reportdir = pathToReport
     common.args.apkpath = pathToApk
     common.args.debuglevel = None
     common.args.acceptterms = None
@@ -446,7 +426,89 @@ def runAutomated(pathToApk,pathToReport):
     common.args.manifest = None
     common.args.version = False
     common.interactive_mode = False
+
+
+def nonAutomatedParseArgs():
+    os.system('clear')
+    print """ .d88888b.           d8888   8888888b.    888    d8P  
+d88P" "Y88b         d88888   888   Y88b   888   d8P   
+888     888        d88P888   888    888   888  d8P    
+888     888       d88P 888   888   d88P   888d88K     
+888     888      d88P  888   8888888P"    8888888b    
+888 Y8b 888     d88P   888   888 T88b     888  Y88b   
+Y88b.Y8b88P    d8888888888   888  T88b    888   Y88b  
+ "Y888888"    d88P     888   888   T88b   888    Y88b 
+        Y8b                                            """
+
+
+
+    common.logger = logging.getLogger()
+    common.rootDir = os.path.dirname(os.path.realpath(__file__))
+    common.runningAutomated = False
+    common.exploitLocation = ''
+
+    #Initialize system
+    #Verify that settings.properties always exists
+    if not os.path.exists(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties"):
+        f = open(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties",'w')
+        f.close()
+
+    common.writeKey("rootDir", common.rootDir)
+
+    common.initialize_logger()
+    parser = setup_argparse()
+
+    common.args = parser.parse_args()
     main()
+
+
+def runAutomated(pathToApk='',pathToReport='', command_line_arguments='', pathToLog=None, buildDir=None):
+    os.system('clear')
+    print """ .d88888b.           d8888   8888888b.    888    d8P  
+d88P" "Y88b         d88888   888   Y88b   888   d8P   
+888     888        d88P888   888    888   888  d8P    
+888     888       d88P 888   888   d88P   888d88K     
+888     888      d88P  888   8888888P"    8888888b    
+888 Y8b 888     d88P   888   888 T88b     888  Y88b   
+Y88b.Y8b88P    d8888888888   888  T88b    888   Y88b  
+ "Y888888"    d88P     888   888   T88b   888    Y88b 
+        Y8b                                            """
+
+    if pathToLog:
+        logging.basicConfig(filename=pathToLog, level=logging.DEBUG)
+
+    common.rootDir = os.path.dirname(os.path.realpath(__file__))
+    common.writeKey("rootDir", common.rootDir)
+    common.initialize_logger()
+    common.logger = logging.getLogger()
+    if not pathToApk and not pathToReport and not command_line_arguments:
+        common.logger.error("Please specify pathToApk and pathToReport, or command_line_arguments")
+    elif command_line_arguments and (pathToApk or pathToReport):
+        common.logger.info("Running only with command_line_arguments, disregarding pathToApk and pathToReport")
+
+    common.runningAutomated = True
+    common.buildLocation = buildDir
+
+    #Initialize system
+    #Verify that settings.properties always exists
+    if not os.path.exists(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties"):
+        f = open(os.path.dirname(os.path.realpath(__file__)) + "/settings.properties",'w')
+        f.close()
+
+    if command_line_arguments:
+        parser = setup_argparse()
+        try:
+            common.args = parser.parse_args(shlex.split(command_line_arguments))
+        except:
+            common.logger.exception("Failed to parse command line arguments, arguments: %s", command_line_arguments)
+            common.logger.info("Using defaults instead")
+            run_automated_defaults(pathToApk, pathToReport)
+        else:
+            common.interactive_mode = False
+    else:
+        run_automated_defaults(pathToApk, pathToReport)
+    main()
+
 
 def main():
 
@@ -463,30 +525,32 @@ def main():
             if common.args.apkpath is None:
                 common.logger.error("When selecting --source=1, Please provide the path to the APK via --pathtoapk flag")
                 exit()
-            if common.args.exploit is None:
-                common.logger.error("--exploit flag missing. Possible values 0/1")
+            if int(common.args.exploit) not in (0,1,2):
+                common.logger.error("--exploit flag invalid. Possible values 0/1/2")
                 exit()
-            if int(common.args.exploit) == 1:
-                if common.args.install is None:
-                    common.logger.error("--install flag missing. Possible values 0/1")
-                    exit()
-        if common.args.source==2:
+            # if common.args.decompile is None:
+            #     common.logger.error("--decompile flag missing. Possible values 0/1. 0 to continue with Static Code Analysis and 1 to EXIT after decompilation\n")
+            #     exit()
+            # if int(common.args.decompile) not in (0, 1):
+            #     common.logger.error("Incorrect value in --decompile flag. Possible values 0/1. 0 to continue with Static Code Analysis and 1 to EXIT after decompilation\n")
+            #     exit()
+        if common.args.source == 2:
             if common.args.autodetect is None:
-                if common.args.manifest is None or common.args.codepath is None:
-                    common.logger.error("When selecting --source=2, Please either pass --autodetectcodepath=1 or both --manifest and --codepath")
-            if common.args.exploit is None:
-                common.logger.error("--exploit flag missing. Possible values 0/1")
-                exit()
-            if int(common.args.exploit) == 1:
-                if common.args.install is None:
-                    common.logger.error("--install flag missing. Possible values 0/1")
+                if common.args.codepath is None or common.args.manifest is None:
+                    common.logger.error("When selecting --source=2, Please either pass --autodetectcodepath=1 and --manifest, or --manifest False --codepath /path/to/code")
                     exit()
+            else:
+                if common.args.manifest is None:
+                    common.logger.error("--manifest flag missing. Please provide path to manifest")
+                    exit()
+                else:
+                    common.args.codepath = common.args.manifest  # auto-detect uses the manifest file path
 
     if common.args.debuglevel is not None:
         if int(common.args.debuglevel) in range(10,60):
             common.logger.setLevel(int(common.args.debuglevel))
         else:
-            parser.error("Please provide a valid Debug level (10,20,30,40,50,60)")
+            common.logger.error("Please provide a valid Debug level (10,20,30,40,50,60)")
 
     exploit_choice = 1
 
@@ -598,7 +662,7 @@ def main():
             if common.interactive_mode:
                 show=raw_input("Inspect Manifest?[y/n]")
                 if show in ['y','Y']:
-                    common.logger.info(common.manifest)
+                    common.logger.info("Manifest contents: %s", common.manifest)
                     raw_input("Press ENTER key to continue")
             else:
                 common.logger.info(common.manifest)
@@ -614,28 +678,31 @@ def main():
         # Check if all required arguments are present before proceeding
         while True:
             if common.interactive_mode:
-                common.sourceDirectory=os.path.abspath(raw_input(common.config.get('qarkhelper','SOURCE_PROMPT')).rstrip())
+                common.sourceDirectory = os.path.abspath(raw_input(common.config.get('qarkhelper','SOURCE_PROMPT')).rstrip())
             else:
-                common.sourceDirectory=common.args.codepath
-            re.sub(r'AndroidManifest.xml','',common.sourceDirectory)
+                common.sourceDirectory = common.args.codepath
+            common.sourceDirectory = re.sub(r'AndroidManifest.xml','',common.sourceDirectory)
             common.sourceDirectory = os.path.abspath(str(common.sourceDirectory).strip())
             common.sourceDirectory = re.sub("\\\\\s",' ',common.sourceDirectory)
             if os.path.isdir(common.sourceDirectory):
                 if not common.sourceDirectory.endswith('/'):
-                    common.sourceDirectory+='/'
-                manifest = find_manifest_in_source()
-                if not common.interactive_mode:
-                    process_manifest(common.args.manifest)
-                else:
-                    process_manifest(manifest)
+                    common.sourceDirectory += '/'
+                if valid_manifest_file(common.args.manifest):
+                    manifest = find_manifest_in_source()
+                    if not common.interactive_mode:
+                        process_manifest(common.args.manifest)
+                    else:
+                        process_manifest(manifest)
                 break
             else:
-                common.logger.error("Not a directory. Please try again")
+                common.logger.error("%s is not a valid directory. Please try again" % common.sourceDirectory)
+                if not common.interactive_mode:
+                    exit()
+
         report.write("apkpath", common.sourceDirectory)
         totalfiles = 0
         for root, dirnames, filenames in os.walk(common.sourceDirectory):
-            for filename in fnmatch.filter(filenames, '*'):
-                totalfiles = totalfiles + 1
+            totalfiles += len(fnmatch.filter(filenames, '*'))
         report.write("totalfiles",totalfiles)
 
     else:
@@ -643,54 +710,55 @@ def main():
     #Only application and manifest elements are required: http://developer.android.com/guide/topics/manifest/manifest-intro.html
     try:
 #    	THIS SECTION IS THE ONE AFTER VIEWING MANIFEST BEFORE DECOMPILATION
-#		THIS CONTAINS THE CODE THAT FINDS ACTIVITIES THAT HAVEN'T BEEN PROTECTED BY ANY PERMISSIONS	
-        determine_min_sdk()
+#		THIS CONTAINS THE CODE THAT FINDS ACTIVITIES THAT HAVEN'T BEEN PROTECTED BY ANY PERMISSIONS
+        if valid_manifest_file(common.args.manifest):
+            determine_min_sdk()
 
-        common.print_terminal_header("APP COMPONENT ATTACK SURFACE")
+            common.print_terminal_header("APP COMPONENT ATTACK SURFACE")
 
-        app = common.xmldoc.getElementsByTagName("application")
-        common.compare(app.length,1,common.config.get('qarkhelper', 'APP_ELEM_ISSUE'), 'true')
+            app = common.xmldoc.getElementsByTagName("application")
+            common.compare(app.length,1,common.config.get('qarkhelper', 'APP_ELEM_ISSUE'), 'true')
 
-        GeneralIssues.verify_allow_backup(app)
-        GeneralIssues.verify_custom_permissions()
-        GeneralIssues.verify_debuggable(app)
+            GeneralIssues.verify_allow_backup(app)
+            GeneralIssues.verify_custom_permissions()
+            GeneralIssues.verify_debuggable(app)
 
-        common.logger.info("Checking provider")
-        prov_priv_list, prov_exp_list, prov_exp_perm_list, prov_prot_broad_list, report_data, results =common.check_export('provider',True)
-        report_badger("appcomponents", results)
-        common.print_terminal(report_data)
+            common.logger.info("Checking provider")
+            prov_priv_list, prov_exp_list, prov_exp_perm_list, prov_prot_broad_list, report_data, results =common.check_export('provider',True)
+            report_badger("appcomponents", results)
+            common.print_terminal(report_data)
 
-        common.logger.info("Checking activity")
-        act_priv_list, act_exp_list, act_exp_perm_list, act_prot_broad_list=[],[],[],[]
-        act_priv_list, act_exp_list, act_exp_perm_list, act_prot_broad_list, report_data, results=common.check_export('activity',True)
+            common.logger.info("Checking activity")
+            act_priv_list, act_exp_list, act_exp_perm_list, act_prot_broad_list=[],[],[],[]
+            act_priv_list, act_exp_list, act_exp_perm_list, act_prot_broad_list, report_data, results=common.check_export('activity',True)
 
-        #Normalizing activity names for use in exploit APK, so all will be absolute
-        act_priv_list=common.normalizeActivityNames(act_priv_list,common.qark_package_name)
-        act_exp_list=common.normalizeActivityNames(act_exp_list,common.qark_package_name)
-        act_exp_perm_list=common.normalizeActivityNames(act_exp_perm_list,common.qark_package_name)
-        act_prot_broad_list=common.normalizeActivityNames(act_prot_broad_list,common.qark_package_name)
+            #Normalizing activity names for use in exploit APK, so all will be absolute
+            act_priv_list=common.normalizeActivityNames(act_priv_list,common.qark_package_name)
+            act_exp_list=common.normalizeActivityNames(act_exp_list,common.qark_package_name)
+            act_exp_perm_list=common.normalizeActivityNames(act_exp_perm_list,common.qark_package_name)
+            act_prot_broad_list=common.normalizeActivityNames(act_prot_broad_list,common.qark_package_name)
 
-        report_badger("appcomponents", results)
-        common.print_terminal(report_data)
+            report_badger("appcomponents", results)
+            common.print_terminal(report_data)
 
-        common.logger.info("Checking activity-alias")
-        #TODO - Normalize activity alias names?
-        actalias_priv_list, actalias_exp_list, actalias_exp_perm_list,actalias_prot_broad_list=[],[],[],[]
-        actalias_priv_list, actalias_exp_list, actalias_exp_perm_list,actalias_prot_broad_list, report_data, results=common.check_export('activity-alias',True)
-        report_badger("appcomponents", results)
-        common.print_terminal(report_data)
+            common.logger.info("Checking activity-alias")
+            #TODO - Normalize activity alias names?
+            actalias_priv_list, actalias_exp_list, actalias_exp_perm_list,actalias_prot_broad_list=[],[],[],[]
+            actalias_priv_list, actalias_exp_list, actalias_exp_perm_list,actalias_prot_broad_list, report_data, results=common.check_export('activity-alias',True)
+            report_badger("appcomponents", results)
+            common.print_terminal(report_data)
 
-        common.logger.info("Checking services")
-        serv_priv_list, serv_exp_list, serv_exp_perm_list,serv_prot_broad_list=[],[],[],[]
-        serv_priv_list, serv_exp_list, serv_exp_perm_list,serv_prot_broad_list, report_data, results=common.check_export('service',True)
-        report_badger("appcomponents", results)
-        common.print_terminal(report_data)
+            common.logger.info("Checking services")
+            serv_priv_list, serv_exp_list, serv_exp_perm_list,serv_prot_broad_list=[],[],[],[]
+            serv_priv_list, serv_exp_list, serv_exp_perm_list,serv_prot_broad_list, report_data, results=common.check_export('service',True)
+            report_badger("appcomponents", results)
+            common.print_terminal(report_data)
 
-        common.logger.info("Checking receivers")
-        rec_priv_list, rec_exp_list, rec_exp_perm_list,rec_prot_broad_list=[],[],[],[]
-        rec_priv_list, rec_exp_list, rec_exp_perm_list,rec_prot_broad_list, report_data, results=common.check_export('receiver',True)
-        report_badger("appcomponents", results)
-        common.print_terminal(report_data)
+            common.logger.info("Checking receivers")
+            rec_priv_list, rec_exp_list, rec_exp_perm_list,rec_prot_broad_list=[],[],[],[]
+            rec_priv_list, rec_exp_list, rec_exp_perm_list,rec_prot_broad_list, report_data, results=common.check_export('receiver',True)
+            report_badger("appcomponents", results)
+            common.print_terminal(report_data)
 
     except Exception as e:
         common.logger.error(traceback.format_exc())
@@ -698,7 +766,7 @@ def main():
     #Begin static code Analysis
     #Easy Wins first
     if common.source_or_apk == 1 and common.interactive_mode:
-            stop_point = raw_input("Press ENTER key to begin decompilation")
+            raw_input("Press ENTER key to begin decompilation")
 
     #Converting dex files to jar
     if common.source_or_apk!=1:
@@ -730,14 +798,36 @@ def main():
     #find all R.java files
     common.xml_files=common.find_xml(common.sourceDirectory)
 
-    if common.interactive_mode:
-        stop_point = raw_input("Press ENTER key to begin Static Code Analysis")
+    '''
+        Decompile switch to take user input to stop after decompilation or continue with static code analysis
+    '''
 
-    #Regex to look for collection of deviceID
-    #Regex to determine if WebViews are imported
-    wv_imp_rex=r'android.webkit.WebView'
+    if common.source_or_apk == 1:
+        try:
+            if common.interactive_mode:
+                print common.term.cyan + common.term.bold + str(common.config.get('qarkhelper', 'DECOMPILE_CHOICE')).decode('string-escape').format(t=common.term)
+                decompile_choice = raw_input(common.config.get('qarkhelper', 'ENTER_YOUR_CHOICE'))
+                if decompile_choice == "1":
+                    common.exitClean()
+                    exit()
+                else:
+                    if decompile_choice != "2":
+                        print common.term.cyan + common.term.bold + "You just had 2 options and still you messed up. Let me select option 2 for you."
+            else:
+                if common.args.decompile == True:
+                    common.exitClean()
+                    exit()
+        except Exception as e:
+            if not common.interactive_mode:
+                common.logger.error(common.config.get('qarkhelper','NOT_A_VALID_OPTION'))
+                exit()
+            common.logger.error(common.config.get('qarkhelper','NOT_A_VALID_OPTION_INTERACTIVE'))
+
+    # Regex to look for collection of deviceID
+    # Regex to determine if WebViews are imported
+    # wv_imp_rex=r'android.webkit.WebView'
     cp_imp_rex=r'android.content.ContentProvider'
-    #Run through all files, look for regex, print warning/info text and lines of code, with file names/paths
+    # Run through all files, look for regex, print warning/info text and lines of code, with file names/paths
 
     cert_queue = Queue()
     pending_intents_queue = Queue()
@@ -777,12 +867,12 @@ def main():
 
         # TODO: change to list comprehension to make it more pythonic
         # all static writers included in every static analysis
-        writers = [common.Writer((0, height-8)), common.Writer((0, height-6)), common.Writer((0, height-4)), 
+        writers = [common.Writer((0, height-8)), common.Writer((0, height-6)), common.Writer((0, height-4)),
                     common.Writer((0, height-2)), common.Writer((0, height-10)), common.Writer((0, height-12)), common.Writer((0, height-14))]
         common.qark_main_pbars = {}
 #         if common.args.noprogressbar:
 #         	print('Progress bars disabled. Running...')
-   
+
         # create dictionary for progress bars, common.qark_main_pbars = { name: ProgressBar }
 #         else:
         for barNum in range(len(PROGRESS_BARS)-1):
@@ -796,7 +886,7 @@ def main():
             if 'Plugin issues' not in common.qark_main_pbars:
                 common.qark_main_pbars['Plugin issues'] = {}
 
-            common.qark_main_pbars['Plugin issues'][plugin.plugin_object.getName()] = ProgressBar(widgets=[plugin.plugin_object.getName(), Percentage(), Bar()], maxval=100, fd=writer).start() 
+            common.qark_main_pbars['Plugin issues'][plugin.plugin_object.getName()] = ProgressBar(widgets=[plugin.plugin_object.getName(), Percentage(), Bar()], maxval=100, fd=writer).start()
             placer += 2
 
         pub.subscribe(progress_bar_update, 'progress')
@@ -820,44 +910,57 @@ def main():
             thread.join()
 
         clear_lines(5)
-        try:
-        #Start looking for stuff potentially vulnerable to malicious apps
-            if len(prov_exp_list)>0:
-                findMethods.map_from_manifest(prov_exp_list,'provider')
-            if len(prov_exp_perm_list)>0:
-                findMethods.map_from_manifest(prov_exp_perm_list,'provider')
-            if len(act_exp_list)>0:
-                findMethods.map_from_manifest(act_exp_list,'activity')
-            if len(act_exp_perm_list)>0:
-                findMethods.map_from_manifest(act_exp_perm_list,'activity')
-                #BUG Need to customize this
-            if len(actalias_exp_list)>0:
-                findMethods.map_from_manifest(actalias_exp_list,'activity-alias')
-            if len(act_exp_perm_list)>0:
-                findMethods.map_from_manifest(actalias_exp_perm_list,'activity-alias')
-            if len(serv_exp_list)>0:
-                findMethods.map_from_manifest(serv_exp_list,'service')
-            if len(serv_exp_perm_list)>0:
-                findMethods.map_from_manifest(serv_exp_perm_list,'service')
-            if len(rec_exp_list)>0:
-                findMethods.map_from_manifest(rec_exp_list,'receiver')
-            if len(rec_exp_perm_list)>0:
-                findMethods.map_from_manifest(rec_exp_perm_list,'receiver')
-        except Exception as e:
-            common.logger.error("Unable to use findMethods to map from manifest: " + str(e))
 
+        if valid_manifest_file(common.args.manifest):
+            try:
+            # Start looking for stuff potentially vulnerable to malicious apps
+                if prov_exp_list:
+                    findMethods.map_from_manifest(prov_exp_list,'provider')
+                if prov_exp_perm_list:
+                    findMethods.map_from_manifest(prov_exp_perm_list,'provider')
+                if act_exp_list:
+                    findMethods.map_from_manifest(act_exp_list,'activity')
+                if act_exp_perm_list:
+                    findMethods.map_from_manifest(act_exp_perm_list,'activity')
+                    #BUG Need to customize this
+                if actalias_exp_list:
+                    findMethods.map_from_manifest(actalias_exp_list,'activity-alias')
+                if act_exp_perm_list:
+                    findMethods.map_from_manifest(actalias_exp_perm_list,'activity-alias')
+                if serv_exp_list:
+                    findMethods.map_from_manifest(serv_exp_list,'service')
+                if serv_exp_perm_list:
+                    findMethods.map_from_manifest(serv_exp_perm_list,'service')
+                if rec_exp_list:
+                    findMethods.map_from_manifest(rec_exp_list,'receiver')
+                if rec_exp_perm_list:
+                    findMethods.map_from_manifest(rec_exp_perm_list,'receiver')
+            except Exception as e:
+                common.logger.error("Unable to use findMethods to map from manifest: " + str(e))
+        results = []
+        for issue in list(crypto_flaw_queue.queue):
+            results.append((issue, "CRYPTO ISSUES"))
+        for issue in list(find_broadcast_queue.queue):
+            results.append((issue, "BROADCAST ISSUES"))
+        for issue in list(cert_queue.queue):
+            results.append((issue, "CERTIFICATE VALIDATION ISSUES"))
+        for issue in list(pending_intents_queue.queue):
+            results.append((issue, "PENDING INTENT ISSUES"))
+        for issue in list(file_permission_queue.queue):
+            results.append((issue, "FILE PERMISSION ISSUES"))
+        for issue in list(web_view_queue.queue):
+            results.append((issue, "WEB-VIEW ISSUES"))
 
-        results = [ (crypto_flaw_queue.get(), "CRYPTO ISSUES"),
-                    (find_broadcast_queue.get(), "BROADCAST ISSUES"), 
-                    (cert_queue.get(), "CERTIFICATE VALIDATION ISSUES"), 
-                    (pending_intents_queue.get(), "PENDING INTENT ISSUES"),
-                    (file_permission_queue.get(), "FILE PERMISSION ISSUES"),
-                    (web_view_queue.get(), "WEB-VIEW ISSUES")
-         ]
+        # results = [ (issue, "CRYPTO ISSUES") for issue in list(crypto_flaw_queue.queue),
+        #             (issue, "BROADCAST ISSUES") for issue in list(find_broadcast_queue.queue),
+        #             (issue, "CERTIFICATE VALIDATION ISSUES") for issue in list(cert_queue.queue),
+        #             (issue, "PENDING INTENT ISSUES") for issue in list(pending_intents_queue.queue),
+        #             (issue, "FILE PERMISSION ISSUES") for issue in list(file_permission_queue.queue),
+        #             (issue, "WEB-VIEW ISSUES") for issue in list(web_view_queue.queue) ]
         if not plugin_queue.empty():
             for i in range(plugin_queue.qsize()):
                 results.append((plugin_queue.get(), "PLUGIN ISSUES"))
-                    
+
         for r in results:
             writeReportSection(r[0], r[1])
 
@@ -881,6 +984,10 @@ def main():
         common.logger.debug("Beginning TapJacking testing")
         findTapJacking.start(common.sourceDirectory)
     else:
+        tapjacking_details = "Since the minSdkVersion is less that 9, it is likely this application is vulnerable to TapJacking. QARK made no attempt to confirm, as the protection would have to be custom code, which is difficult for QARK to examine and understand properly. This vulnerability allows a malicious application to lay on top of this app, while letting the key strokes pass through to the application below. This can cause users to take unwanted actions, within the victim application, similar to Clickjacking on websites. Please select the appropriate options in the exploitation menus to verify manually using QARK's exploit APK. Note: The QARK proof-of-concept is transparent, but in real-world attacks, it would likely not be. This is done solely to aid in testing. For more information: https://media.blackhat.com/ad-12/Niemietz/bh-ad-12-androidmarcus_niemietz-WP.pdf"
+        writeReportSection([ReportIssue(category=ExploitType.MANIFEST, severity=Severity.VULNERABILITY,
+                                       details=tapjacking_details,
+                                       file="manifest.xml"), terminalPrint(data=tapjacking_details)], "PLUGIN ISSUES")
         common.logger.log(common.VULNERABILITY_LEVEL,"Since the minSdkVersion is less that 9, it is likely this application is vulnerable to TapJacking. QARK made no attempt to confirm, as the protection would have to be custom code, which is difficult for QARK to examine and understand properly. This vulnerability allows a malicious application to lay on top of this app, while letting the key strokes pass through to the application below. This can cause users to take unwanted actions, within the victim application, similar to Clickjacking on websites. Please select the appropriate options in the exploitation menus to verify manually using QARK's exploit APK. Note: The QARK proof-of-concept is transparent, but in real-world attacks, it would likely not be. This is done solely to aid in testing. For more information: https://media.blackhat.com/ad-12/Niemietz/bh-ad-12-androidmarcus_niemietz-WP.pdf")
 
 
@@ -912,11 +1019,13 @@ def main():
                 statement_list+=common.text_scan([p[1]],insert_rex)
         if len(cp_dec_list)>0:
             common.logger.info("The Content Providers above should be manually inspected for injection vulnerabilities.")
-    try:
-        #TODO - This is a pain in the ass and incomplete
-        content_provider_uri_permissions()
-    except Exception as e:
-        common.logger.error("Unable to parse Content Provider permissions. Error: " + str(e))
+
+    # content_provider_uri_permissions is not defined so don't bother the user with errors
+    # try:
+    #     #TODO - This is a pain in the ass and incomplete
+    #     content_provider_uri_permissions()
+    # except Exception as e:
+    #     common.logger.error("Unable to parse Content Provider permissions. Error: " + str(e))
 
 
     for item in list(common.parsingerrors):
@@ -933,26 +1042,26 @@ def main():
 
 
     try:
+        if valid_manifest_file(common.args.manifest):
+            if ((prov_exp_list is not None) or (act_exp_list is not None) or (actalias_exp_list is not None) or (serv_exp_list is not None) or (rec_exp_list is not None)):
+                common.logger.info("Until we perfect this, for manually testing, run the following command to see all the options and their meanings: adb shell am. Make sure to update qark frequently to get all the enhancements! You'll also find some good examples here: http://xgouchet.fr/android/index.php?article42/launch-intents-using-adb")
+                try:
 
-        if ((prov_exp_list is not None) or (act_exp_list is not None) or (actalias_exp_list is not None) or (serv_exp_list is not None) or (rec_exp_list is not None)):
-            common.logger.info("Until we perfect this, for manually testing, run the following command to see all the options and their meanings: adb shell am. Make sure to update qark frequently to get all the enhancements! You'll also find some good examples here: http://xgouchet.fr/android/index.php?article42/launch-intents-using-adb")
-            try:
+                    show_exports(prov_exp_list,'provider')
+                    show_exports(act_exp_list,'activity')
+                    show_exports(actalias_exp_list,'alias')
+                    show_exports(serv_exp_list,'service')
+                    show_exports(rec_exp_list,'receiver')
 
-                show_exports(prov_exp_list,'provider')
-                show_exports(act_exp_list,'activity')
-                show_exports(actalias_exp_list,'alias')
-                show_exports(serv_exp_list,'service')
-                show_exports(rec_exp_list,'receiver')
+                    print """\nTo view any sticky broadcasts on the device:
+                    adb shell dumpsys activity| grep sticky\n"""
 
-                print "\nTo view any sticky broadcasts on the device:"
-                print "adb shell dumpsys activity| grep sticky\n"
+                    common.logger.info("Support for other component types and dynamically adding extras is in the works, please check for updates")
 
-                common.logger.info("Support for other component types and dynamically adding extras is in the works, please check for updates")
-
-            except Exception as e:
-                common.logger.error("Problem running show_exports in qark.py: " + str(e))
-        else:
-            print "Sorry, nothing exploitable via ADB"
+                except Exception as e:
+                    common.logger.error("Problem running show_exports in qark.py: " + str(e))
+            else:
+                print "Sorry, nothing exploitable via ADB"
     except Exception as e:
         common.logger.error("Unfortunately, we were unable to print out the ADB commands for exploitation: " + str(e))
 
@@ -967,7 +1076,7 @@ def main():
                 else:
                     common.logger.error(common.config.get('qarkhelper','NOT_A_VALID_OPTION_INTERACTIVE'))
             else:
-                if int(common.args.exploit) in (0,1):
+                if int(common.args.exploit) in (0,1,2):
                     exploit_choice = int(common.args.exploit)
                     break
                 else:
@@ -979,12 +1088,18 @@ def main():
                 exit()
             common.logger.error(common.config.get('qarkhelper','NOT_A_VALID_OPTION_INTERACTIVE'))
 
-    if exploit_choice==1:
+    if exploit_choice==1 and valid_manifest_file(common.args.manifest):
         # Exploit all vulnerabilities
         print "Generating exploit payloads for all vulnerabilities"
         type_list=['String','StringArray','StringArrayList','Boolean','BooleanArray','Int','Float','Long','LongArray','[]','','IntArray','IntegerArrayList','FloatArray','Double','Char','CharArray','CharSequence','CharSequenceArray','CharSequenceArrayList','Byte','ByteArray', 'Bundle','Short','ShortArray','Serializable','Parcelable','ParcelableArrayList','ParcelableArray','unknownType']
-        shutil.rmtree(common.getConfig("rootDir") +'/build')
-        if str(createSploit.copy_template(common.getConfig("rootDir") + '/exploitAPKs/qark/',common.getConfig("rootDir") + '/build/qark')) is not 'ERROR':
+        # actual_root_dir is exploit destination
+        actual_root_dir = common.getConfig("rootDir") if not common.buildLocation else common.buildLocation
+        common.exploitLocation = actual_root_dir + '/build/qark'
+        try:
+            shutil.rmtree(actual_root_dir + '/build')
+        except:
+            common.logger.debug('The directory at %s doesn\'t exist', actual_root_dir + '/build')
+        if str(createSploit.copy_template(common.getConfig("rootDir") + '/exploitAPKs/qark/', actual_root_dir + '/build/qark')) is not 'ERROR':
             common.exploitLocation = common.getConfig("rootDir") + '/build/qark'
             if len(prov_exp_list)>0:
                 common.logger.info("Sorry, we're still working on the providers")
@@ -1071,7 +1186,7 @@ def main():
                 if install_option:
                     install = "y"
                 else:
-                    install_option = "n"
+                    install = "n"
             if install=='y':
                 apkList = list_all_apk()
                 for apk in apkList:
@@ -1079,25 +1194,88 @@ def main():
                         uninstall(str(apk).split("/")[-1].rstrip(".apk"))
                 common.logger.info("Installing...")
                 try:
-                    common.logger.info("The apk can be found in the "+common.getConfig("rootDir")+"/build/qark directory")
+                    common.logger.info("The apk can be found in the " + actual_root_dir + "/build/qark directory")
                     subprocess.call("adb install " + common.getConfig("rootDir") + "/build/qark/app/build/outputs/apk/app-debug.apk",shell=True)
                 except Exception as e:
                     common.logger.error("Problems installing exploit APK: " + str(e))
             else:
-                common.logger.info("The apk can be found in the "+common.getConfig("rootDir")+"/build/qark directory")
-    elif exploit_choice==2:
+                common.logger.info("The apk can be found in the "+ actual_root_dir +"/build/qark directory")
+    elif exploit_choice == 2:
+        # JSON, XML and CSV file formatting
+        # Overwrite the CSV file with the header and write the entire data again
+        with open('./Report.csv', 'r') as f:
+            r = csv.reader(f)
+            data = [line for line in r]
+        with open('./Report.csv', 'w') as f:
+            w = csv.writer(f)
+            w.writerow(["severity", "details", "file", "extra", "type"])
+            w.writerows(data)
+
+        # Convert CSV to JSON
+        # Constants to make everything easier
+
+        CSV_PATH = './Report.csv'
+        JSON_PATH = './Report.json'
+        XML_PATH = './Report.xml'
+
+        # Reads the file the same way that you did
+        csv_file = csv.DictReader(open(CSV_PATH, 'r'))
+
+        # Created a list and adds the rows to the list
+        json_list = []
+        for row in csv_file:
+            json_list.append(row)
+
+        # Writes the json output to the file
+        json_object = json.dumps(json_list)
+        file(JSON_PATH, 'w').write(json_object)
+
+        # Delete the CSV report as it contains redundant data
+        os.remove('./Report.csv')
+
+        # Remove redundant data from JSON file
+        with open('./Report.json') as fp:
+            ds = json.load(fp)  # this file contains the json
+
+            mem = {}
+
+            for record in ds:
+                name = record["details"]
+                if name not in mem:
+                    mem[name] = record
+
+            unique_json_object = mem.values()
+
+        # Pretty print JSON Output
+        parsed = json.loads(json.dumps(unique_json_object))
+        final_json_object = json.dumps(parsed, indent=4, sort_keys=True)
+        file(JSON_PATH, 'w').write(final_json_object)
+
+        # Creating report in XML format
+        XML_report = json.loads(final_json_object)
+        XML_object = json2xml(XML_report)
+        file(XML_PATH, 'w').write(XML_object)
+
+        print "A JSON report of the findings is located in : {}".format(common.reportDir)
+        print "An XML report of the findings is located in : {}".format(common.reportDir)
+
         if common.reportInitSuccess:
-            print "An html report of the findings is located in : " + common.reportDir
+            print "An html report of the findings is located in : {}".format(common.reportDir)
         else:
-            common.logger.error("Problem with reporting; No html report generated. Please see the readme file for possible solutions.")
+            common.logger.error(
+                "Problem with reporting; No html report generated. Please see the readme file for possible solutions.")
         common.exitClean()
     if common.reportInitSuccess:
         print "An html report of the findings is located in : " + common.reportDir
     else:
-        common.logger.error("Problem with reporting; No html report generated. Please see the readme file for possible solutions.")
+        common.logger.error(
+            "Problem with reporting; No html report generated. Please see the readme file for possible solutions.")
 
-    print "Goodbye!"
-    raise SystemExit
+    if not common.runningAutomated:
+        print "Goodbye!"
+        raise SystemExit
 
 if __name__ == "__main__":
-	nonAutomatedParseArgs()
+    # Create a CSV file to store results
+    csv.writer(open('./Report.csv', 'w+'))
+    nonAutomatedParseArgs()
